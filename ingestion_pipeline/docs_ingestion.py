@@ -11,7 +11,7 @@ load_dotenv()
 
 # === Config ===
 SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-INDEX_NAME = "docs-index-v1"
+INDEX_NAME = os.getenv("AZURE_SEARCH_DOC_INDEX")
 
 tenant_id = os.getenv("AZURE_TENANT_ID")
 client_id = os.getenv("AZURE_SEARCH_CLIENT_ID")

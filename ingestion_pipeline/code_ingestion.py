@@ -5,38 +5,98 @@ import time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import AzureOpenAIEmbeddings
 from azure.search.documents import SearchClient
-from azure.identity import ClientSecretCredential
+# from azure.identity import ClientSecretCredential
+from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
 import hashlib
+from datetime import datetime
+import logging
 
 load_dotenv()
 
-CPP_LANGUAGE = Language("/Users/kumarn/workspace/build/my-languages.so", "cpp")
+os.makedirs("metadata", exist_ok=True)
+os.makedirs("logs", exist_ok=True)
+os.makedirs("dryrun", exist_ok=True)
+log_filename = f"logs/ingestion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-parser = Parser()
-parser.set_language(CPP_LANGUAGE)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+fh = logging.FileHandler(log_filename)
+fh.setLevel(logging.INFO)
+fh.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch.setFormatter(logging.Formatter("%(message)s"))
+
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+logger.addHandler(fh)
+logger.addHandler(ch)
+
+logger.info(f"Logging to {log_filename}")
+
+
+# Dynamically load repositories from separate environment variables for each language
+REPOS = []
+def load_repos_by_language(env_var, language):
+    repo_env = os.getenv(env_var)
+    if not repo_env:
+        logger.info(f"Warning: No {env_var} environment variable found.")
+        return []
+    repos = []
+    for repo_name in [r.strip() for r in repo_env.split(",") if r.strip()]:
+        repo_path = os.getenv(repo_name)
+        if repo_path:
+            repos.append((repo_name, repo_path, language))
+        else:
+            logger.info(f"Warning: Environment variable for repository path '{repo_name}' is missing. Skipping.")
+    return repos
+
+REPOS.extend(load_repos_by_language("CPP_REPOS", "cpp"))
+REPOS.extend(load_repos_by_language("PYTHON_REPOS", "python"))
+REPOS.extend(load_repos_by_language("JAVA_REPOS", "java"))
+REPOS.extend(load_repos_by_language("SQL_REPOS", "sql"))
+
+if not REPOS:
+    logger.info("Warning: No repositories defined in CPP_REPOS/PYTHON_REPOS/JAVA_REPOS/SQL_REPOS. No repositories will be processed.")
+
+LANGUAGE_LIB = "/Users/kumarn/workspace/build/my-languages.so"
+
+LANGUAGES = {
+    "cpp": Language(LANGUAGE_LIB, "cpp"),
+    "python": Language(LANGUAGE_LIB, "python"),
+    "java": Language(LANGUAGE_LIB, "java"),
+    "sql": Language(LANGUAGE_LIB, "sql")
+}
 
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-AZURE_SEARCH_INDEX_NAME = "code-index-v4"
-AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
-AZURE_SEARCH_CLIENT_ID = os.getenv("AZURE_SEARCH_CLIENT_ID")
-AZURE_SEARCH_CLIENT_SECRET = os.getenv("AZURE_SEARCH_CLIENT_SECRET")
+AZURE_SEARCH_API_KEY = os.getenv("AZURE_SEARCH_API_KEY")
+AZURE_SEARCH_CODE_INDEX = os.getenv("AZURE_SEARCH_CODE_INDEX")
+
+# AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
+# AZURE_SEARCH_CLIENT_ID = os.getenv("AZURE_SEARCH_CLIENT_ID")
+# AZURE_SEARCH_CLIENT_SECRET = os.getenv("AZURE_SEARCH_CLIENT_SECRET")
+
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-REPO_NAME = os.getenv("REPO_NAME", "XXXX")
 
-# Use your actual OpenGrok base URL here
-OPENGROK_BASE_URL = "https://opengrok.cicd.rnd.ORG_NAME.net/xref/PROJECT_NAME/REPO_NAME/"
+OPENGROK_BASE_URL_TEMPLATE = os.getenv("OPENGROK_BASE_URL_TEMPLATE")
 
-DRY_RUN = False  # Set True to skip actual uploading and just output to file
+DRY_RUN = True  # Set True to skip actual uploading and just output to file
 
-credential = ClientSecretCredential(
-    tenant_id=AZURE_TENANT_ID,
-    client_id=AZURE_SEARCH_CLIENT_ID,
-    client_secret=AZURE_SEARCH_CLIENT_SECRET
-)
+# Environment variable to force full run (ignore last run metadata)
+FORCE_FULL_RUN = os.getenv("FORCE_FULL_RUN", "false").lower() == "true"
+
+# credential = ClientSecretCredential(
+#     tenant_id=AZURE_TENANT_ID,
+#     client_id=AZURE_SEARCH_CLIENT_ID,
+#     client_secret=AZURE_SEARCH_CLIENT_SECRET
+# )
 
 embeddings = AzureOpenAIEmbeddings(
     azure_deployment=AZURE_OPENAI_DEPLOYMENT_NAME,
@@ -48,8 +108,8 @@ embeddings = AzureOpenAIEmbeddings(
 
 search_client = SearchClient(
     endpoint=AZURE_SEARCH_ENDPOINT,
-    index_name=AZURE_SEARCH_INDEX_NAME,
-    credential=credential,
+    index_name=AZURE_SEARCH_CODE_INDEX,
+    credential=AzureKeyCredential(AZURE_SEARCH_API_KEY),
 )
 
 def get_node_text(node, code_bytes):
@@ -253,51 +313,62 @@ def extract_functions_and_macros(root_node, code_bytes):
     traverse(root_node)
     return results
 
-def process_file(filepath):
-    print(f"Starting processing file: {filepath}")
+def process_file(filepath, repo_name, language):
+    parser = Parser()
+    parser.set_language(LANGUAGES[language])
+    logger.info(f"Starting processing file: {filepath}")
     start_time = time.time()
     with open(filepath, "rb") as f:
         code_bytes = f.read()
     tree = parser.parse(code_bytes)
     root_node = tree.root_node
     symbols = extract_functions_and_macros(root_node, code_bytes)
-    print(f"Extracted {len(symbols)} symbols from file: {filepath}")
+    logger.info(f"Extracted {len(symbols)} symbols from file: {filepath}")
     last_modified = os.path.getmtime(filepath)
     last_modified_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_modified))
     for sym in symbols:
         sym["file_name"] = os.path.basename(filepath)
         sym["file_path"] = filepath
         sym["lastModified"] = last_modified_str
-    print(f"Finished processing file: {filepath}")
+        sym["repo"] = repo_name
+        sym["language"] = language
+    logger.info(f"Finished processing file: {filepath}")
     elapsed = time.time() - start_time
-    print(f"Time taken for file {filepath}: {elapsed:.2f} seconds")
+    logger.info(f"Time taken for file {filepath}: {elapsed:.2f} seconds")
     return symbols
 
-def process_folder(folder_path):
-    print(f"Starting processing folder: {folder_path}")
-    exts = (".cpp", ".hpp", ".h")
+def process_folder(folder_path, repo_name, language):
+    logger.info(f"Starting processing folder: {folder_path} (repo: {repo_name})")
+    EXTENSIONS = {
+        "cpp": (".cpp", ".hpp", ".h"),
+        "python": (".py",),
+        "java": (".java",),
+        "sql": (".sql",)
+    }
+    exts = EXTENSIONS.get(language, ())
     all_symbols = []
     for root, dirs, files in os.walk(folder_path):
         for fname in files:
             if fname.endswith(exts):
                 filepath = os.path.join(root, fname)
-                print(f"Processing file: {filepath}")
+                logger.info(f"Processing file: {filepath}")
                 try:
-                    syms = process_file(filepath)
+                    syms = process_file(filepath, repo_name, language)
                     all_symbols.extend(syms)
                 except Exception as e:
-                    print(f"Error processing file {filepath}: {e}")
+                    logger.info(f"Error processing file {filepath}: {e}")
                     all_symbols.append({
                         "file_name": fname,
                         "file_path": filepath,
-                        "error": str(e)
+                        "error": str(e),
+                        "repo": repo_name
                     })
-                print(f"Completed file: {filepath}")
-    print(f"Completed processing folder: {folder_path} with total symbols: {len(all_symbols)}")
+                logger.info(f"Completed file: {filepath}")
+    logger.info(f"Completed processing folder: {folder_path} with total symbols: {len(all_symbols)}")
     return all_symbols
 
 def chunk_symbol(symbol):
-    print(f"Chunking symbol: {symbol.get('symbol', '<unknown>')} of type {symbol.get('type', '')}")
+    logger.info(f"Chunking symbol: {symbol.get('symbol', '<unknown>')} of type {symbol.get('type', '')}")
     # Compose the text to chunk: comments (if any), then signature, then body
     comments = symbol.get("comments", "")
     text_to_chunk = ""
@@ -315,98 +386,177 @@ def chunk_symbol(symbol):
     chunks = splitter.split_text(text_to_chunk)
     return chunks
 
-def generate_document(chunk, symbol):
-    print(f"Generating document for chunk of symbol: {symbol.get('symbol', '<unknown>')}")
-    h = hashlib.sha256()
-    h.update(chunk.encode('utf-8'))
-    doc_id = h.hexdigest()
+def compute_doc_id(symbol, chunk):
+    """Generate deterministic ID based on repo, file, symbol, and chunk."""
+    data = f"{symbol.get('repo','')}_{symbol.get('file_path','')}_{symbol.get('symbol','')}_{chunk}"
+    return hashlib.sha256(data.encode('utf-8')).hexdigest()
 
-    # Compute rel_path relative to REPO_NAME root folder
-    # Find "REPO_NAME/" in the file_path and slice after it
+def load_last_run_metadata(repo_name):
+    path = f"metadata/{repo_name}_last_run.json"
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_last_run_metadata(repo_name, metadata_dict):
+    path = f"metadata/{repo_name}_last_run.json"
+    with open(path, "w") as f:
+        json.dump(metadata_dict, f, indent=4)
+
+def generate_document(chunk, symbol):
+    logger.info(f"Generating document for chunk of symbol: {symbol.get('symbol', '<unknown>')}")
+    doc_id = compute_doc_id(symbol, chunk)
+
+    # Use repo name from symbol, fallback to empty string for backward compatibility
+    repo = symbol.get("repo", "")
     file_path = symbol.get("file_path", "")
-    rel_path = file_path.split("REPO_NAME/")[-1] if "REPO_NAME/" in file_path else os.path.basename(file_path)
-    opengrok_url = f"{OPENGROK_BASE_URL}{rel_path}?defs={symbol['symbol']}"
+    # Compute rel_path relative to repo src root
+    # Try to find "{repo}/" in the file_path, else fallback to basename
+    rel_path = None
+    repo_search = f"{repo}/"
+    if repo_search in file_path:
+        rel_path = file_path.split(repo_search, 1)[-1]
+    else:
+        rel_path = os.path.basename(file_path)
+    if "{repo}" in OPENGROK_BASE_URL_TEMPLATE:
+        base_url = OPENGROK_BASE_URL_TEMPLATE.format(repo=repo)
+    else:
+        base_url = OPENGROK_BASE_URL_TEMPLATE.rstrip("/") + f"/{repo}/"
+    opengrok_url = f"{base_url}{rel_path}?defs={symbol['symbol']}"
 
     doc = {
         "id": doc_id,
-        "code": chunk,  # store only the chunk (no full body)
+        "code": chunk,
         "symbol": symbol.get("symbol", ""),
         "type": symbol.get("type", ""),
         "signature": symbol.get("signature", ""),
-        # "body": symbol.get("body", ""),  # Removed: do not include full body, just chunk
         "filePath": rel_path,
         "lastModified": symbol.get("lastModified", ""),
-        "repo": REPO_NAME,
+        "repo": repo,
         "opengrokUrl": opengrok_url,
+        "language": symbol.get("language", ""),
     }
     return doc
 
-def upload_documents(docs):
-    print(f"[UPLOAD] Would upload {len(docs)} docs (DRY_RUN={DRY_RUN})")
+def upload_documents(docs, repo_name):
+    logger.info(f"[UPLOAD] Would upload {len(docs)} docs (DRY_RUN={DRY_RUN})")
     if DRY_RUN:
-        with open("dryrun_output.json", "w", encoding="utf-8") as f:
-            json.dump(docs, f, indent=4)
-        print(f"Dry run: wrote {len(docs)} documents to dryrun_output.json")
+        # Truncate embedding to first 3 elements + ["..."] for readability
+        trimmed_docs = []
+        for doc in docs:
+            d = dict(doc)
+            if "embedding" in d and isinstance(d["embedding"], list) and len(d["embedding"]) > 3:
+                d["embedding"] = d["embedding"][:3] + ["..."]
+            trimmed_docs.append(d)
+
+        # Always write a single file per repo per run; no appends, no mixing
+        dryrun_file = f"dryrun/dryrun_output_{repo_name}.json"
+        with open(dryrun_file, "w", encoding="utf-8") as f:
+            json.dump(trimmed_docs, f, indent=4)
+        logger.info(f"Dry run: wrote {len(trimmed_docs)} documents for {repo_name} to {dryrun_file}")
         return
 
     # Check if index exists and is accessible
     try:
         search_client.get_document_count()
     except Exception as e:
-        print(f"Failed to connect to search index: {e}")
+        logger.info(f"Failed to connect to search index: {e}")
         return
 
     batch_size = 500
     for i in range(0, len(docs), batch_size):
         batch = docs[i:i+batch_size]
         try:
-            result = search_client.upload_documents(documents=batch)
-            print(f"Uploaded batch of {len(batch)} documents, status: {result[0].status_code}")
+            result = search_client.merge_or_upload_documents(documents=batch)
+            logger.info(f"Uploaded batch of {len(batch)} documents, status: {result[0].status_code}")
         except Exception as e:
-            print(f"Failed to upload batch: {e}")
+            logger.info(f"Failed to upload batch: {e}")
 
 if __name__ == "__main__":
-    TARGET_DIR = "/FULL_PATH_TO_REPO/src"
-    results = process_folder(TARGET_DIR)
-
     batch_size = 20
     from collections import defaultdict
-    file_to_syms = defaultdict(list)
-    for sym in results:
-        file_to_syms[sym.get("file_path", "<unknown>")].append(sym)
 
-    doc_buffer = []
-    for file_path, syms in file_to_syms.items():
-        file_start_time = time.time()
-        symbol_chunk_info = []
-        for sym in syms:
-            chunks = chunk_symbol(sym)
-            for chunk in chunks:
-                symbol_chunk_info.append((sym, chunk))
-        all_chunks = [chunk for (_, chunk) in symbol_chunk_info]
-        if not all_chunks:
-            continue
-        print(f"Generating embeddings for {len(all_chunks)} chunks from file: {file_path}")
-        embeddings_for_chunks = []
-        for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i:i+batch_size]
-            print(f"Embedding batch of {len(batch)} chunks for file: {file_path}")
-            batch_embeddings = embeddings.embed_documents(batch)
-            print(f"Received {len(batch_embeddings)} embeddings for file: {file_path}")
-            embeddings_for_chunks.extend(batch_embeddings)
-        assert len(embeddings_for_chunks) == len(symbol_chunk_info)
-        docs_for_file = []
-        for (sym, chunk), embedding in zip(symbol_chunk_info, embeddings_for_chunks):
-            doc = generate_document(chunk, sym)
-            doc["embedding"] = embedding
-            docs_for_file.append(doc)
-        doc_buffer.extend(docs_for_file)
-        print(f"Prepared {len(symbol_chunk_info)} documents for file: {file_path}")
-        file_elapsed = time.time() - file_start_time
-        print(f"Total time for embeddings + docs for file {file_path}: {file_elapsed:.2f} seconds")
-        if len(doc_buffer) >= 1000:
-            upload_documents(doc_buffer)
+    for repo_tuple in REPOS:
+        # repo_tuple: (repo_name, repo_path, language)
+        repo_name, repo_path, language = repo_tuple
+        logger.info(f"\n========== Processing repository: {repo_name} [{language}] ==========")
+
+        # a fresh buffer per repo so dry-run JSON never mixes repos
+        doc_buffer = []
+
+        # Load last run metadata for this repo, or ignore if FORCE_FULL_RUN
+        if FORCE_FULL_RUN:
+            last_meta = {}
+            logger.info(f"[FORCE] Ignoring last run metadata for repo: {repo_name}")
+        else:
+            last_meta = load_last_run_metadata(repo_name)
+        current_meta = {}
+        new_or_changed_files = 0
+        skipped_files = 0
+
+        results = process_folder(repo_path, repo_name, language)
+
+        file_to_syms = defaultdict(list)
+        for sym in results:
+            file_to_syms[sym.get("file_path", "<unknown>")].append(sym)
+
+        for file_path, syms in file_to_syms.items():
+            # Check if the file has changed since last run
+            last_modified = os.path.getmtime(file_path)
+            last_modified_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_modified))
+            if file_path in last_meta and last_meta[file_path] == last_modified_str:
+                skipped_files += 1
+                logger.info(f"[SKIP] {file_path} (unchanged)")
+                continue
+
+            current_meta[file_path] = last_modified_str
+            new_or_changed_files += 1
+
+            file_start_time = time.time()
+            symbol_chunk_info = []
+            for sym in syms:
+                chunks = chunk_symbol(sym)
+                for chunk in chunks:
+                    symbol_chunk_info.append((sym, chunk))
+
+            all_chunks = [chunk for (_, chunk) in symbol_chunk_info]
+            if not all_chunks:
+                continue
+
+            logger.info(f"Generating embeddings for {len(all_chunks)} chunks from file: {file_path}")
+            embeddings_for_chunks = []
+            for i in range(0, len(all_chunks), batch_size):
+                batch = all_chunks[i:i+batch_size]
+                logger.info(f"Embedding batch of {len(batch)} chunks for file: {file_path}")
+                batch_embeddings = embeddings.embed_documents(batch)
+                logger.info(f"Received {len(batch_embeddings)} embeddings for file: {file_path}")
+                embeddings_for_chunks.extend(batch_embeddings)
+
+            assert len(embeddings_for_chunks) == len(symbol_chunk_info)
+
+            docs_for_file = []
+            for (sym, chunk), embedding in zip(symbol_chunk_info, embeddings_for_chunks):
+                doc = generate_document(chunk, sym)
+                doc["embedding"] = embedding
+                docs_for_file.append(doc)
+
+            doc_buffer.extend(docs_for_file)
+            logger.info(f"Prepared {len(symbol_chunk_info)} documents for file: {file_path}")
+            file_elapsed = time.time() - file_start_time
+            logger.info(f"Total time for embeddings + docs for file {file_path}: {file_elapsed:.2f} seconds")
+
+            # Only trigger mid-run uploads for NON dry-run mode (batching to the service)
+            if not DRY_RUN and len(doc_buffer) >= 1000:
+                upload_documents(doc_buffer, repo_name)
+                doc_buffer.clear()
+
+        # After processing all files in this repo, save metadata and flush whatever is in the buffer
+        save_last_run_metadata(repo_name, current_meta)
+        logger.info(f"[SUMMARY] Repo={repo_name}, new/changed={new_or_changed_files}, skipped={skipped_files}")
+
+        if doc_buffer:
+            upload_documents(doc_buffer, repo_name)
             doc_buffer.clear()
-    # After all files, flush any remaining docs
-    if doc_buffer:
-        upload_documents(doc_buffer)
+
+    logger.info("=== Ingestion run completed ===")
+    logger.info("Ingestion run complete. Check logs/ and metadata/ for details.")
