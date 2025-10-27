@@ -1,12 +1,14 @@
+from dotenv import load_dotenv
+load_dotenv()
 from atlassian import Confluence
 import os
 import json
 import re
 
 # Replace with your service account details
-CONFLUENCE_URL = "https://org_name.atlassian.net/wiki"
-USERNAME = "robotic_account_mail_id"
-API_TOKEN = "token_value"
+CONFLUENCE_URL = os.getenv("CONFLUENCE_URL")
+USERNAME = os.getenv("CONFLUENCE_USERNAME")
+API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN")
 
 SPACE_KEY = "SPACE_NAME"
 
