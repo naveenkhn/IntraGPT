@@ -1,4 +1,5 @@
 from tree_sitter import Language, Parser
+FLUSH_BATCH_SIZE = 1000
 import os
 import json
 import time
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 import hashlib
 from datetime import datetime
 import logging
+from sql_handler import extract_sql_symbols
 
 load_dotenv()
 
@@ -87,7 +89,7 @@ AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 
 OPENGROK_BASE_URL_TEMPLATE = os.getenv("OPENGROK_BASE_URL_TEMPLATE")
 
-DRY_RUN = True  # Set True to skip actual uploading and just output to file
+DRY_RUN = False  # Set True to skip actual uploading and just output to file
 
 # Environment variable to force full run (ignore last run metadata)
 FORCE_FULL_RUN = os.getenv("FORCE_FULL_RUN", "false").lower() == "true"
@@ -118,8 +120,6 @@ def get_node_text(node, code_bytes):
 def get_node_start_line(node):
     return node.start_point[0] + 1
 
-def get_node_end_line(node):
-    return node.end_point[0] + 1
 
 def extract_functions_and_macros(root_node, code_bytes):
     results = []
@@ -127,7 +127,6 @@ def extract_functions_and_macros(root_node, code_bytes):
     def add_symbol(symbol_type, node, signature_node=None, body_node=None):
         signature_text = get_node_text(signature_node if signature_node else node, code_bytes)
         body_text = get_node_text(body_node, code_bytes) if body_node else None
-
 
         symbol_name = None
         if symbol_type in ['function', 'prototype']:
@@ -183,13 +182,14 @@ def extract_functions_and_macros(root_node, code_bytes):
         if not symbol_name:
             symbol_name = "<unknown>"
 
-        # Get last modified time of file if available (passed externally)
-        # We'll fill it later in the caller.
+        # Only add start_line using helper function
+        start_line = get_node_start_line(node)
 
         symbol_info = {
             "symbol": symbol_name,
             "type": symbol_type,
             "signature": signature_text,
+            "start_line": start_line,
         }
         if body_text:
             symbol_info["body"] = body_text
@@ -237,12 +237,14 @@ def extract_functions_and_macros(root_node, code_bytes):
                         break
                 if not symbol_name:
                     symbol_name = "<unknown>"
-
+                # Add start_line info only
+                start_line = get_node_start_line(node)
                 results.append({
                     "symbol": symbol_name,
                     "type": node.type.replace('_specifier',''),
                     "signature": signature_text,
-                    "body": body_text
+                    "body": body_text,
+                    "start_line": start_line,
                 })
             else:
                 # No body found, treat whole node as signature
@@ -271,11 +273,14 @@ def extract_functions_and_macros(root_node, code_bytes):
                         break
                 if not symbol_name:
                     symbol_name = "enum"
+                # Add start_line info only
+                start_line = get_node_start_line(node)
                 results.append({
                     "symbol": symbol_name,
                     "type": "enum",
                     "signature": signature_text,
-                    "body": body_text
+                    "body": body_text,
+                    "start_line": start_line,
                 })
             else:
                 symbol = add_symbol('enum', node)
@@ -314,15 +319,24 @@ def extract_functions_and_macros(root_node, code_bytes):
     return results
 
 def process_file(filepath, repo_name, language):
-    parser = Parser()
-    parser.set_language(LANGUAGES[language])
     logger.info(f"Starting processing file: {filepath}")
     start_time = time.time()
     with open(filepath, "rb") as f:
         code_bytes = f.read()
-    tree = parser.parse(code_bytes)
-    root_node = tree.root_node
-    symbols = extract_functions_and_macros(root_node, code_bytes)
+
+    if language == "sql":
+        # Use the SQL-specific extractor (DDL only; INSERTs are ignored there)
+        parser = Parser()
+        parser.set_language(LANGUAGES[language])
+        tree = parser.parse(code_bytes)
+        root_node = tree.root_node
+        symbols = extract_sql_symbols(root_node, code_bytes)
+    else:
+        parser = Parser()
+        parser.set_language(LANGUAGES[language])
+        tree = parser.parse(code_bytes)
+        root_node = tree.root_node
+        symbols = extract_functions_and_macros(root_node, code_bytes)
     logger.info(f"Extracted {len(symbols)} symbols from file: {filepath}")
     last_modified = os.path.getmtime(filepath)
     last_modified_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_modified))
@@ -418,11 +432,14 @@ def generate_document(chunk, symbol):
         rel_path = file_path.split(repo_search, 1)[-1]
     else:
         rel_path = os.path.basename(file_path)
-    if "{repo}" in OPENGROK_BASE_URL_TEMPLATE:
-        base_url = OPENGROK_BASE_URL_TEMPLATE.format(repo=repo)
+    relative_path = rel_path
+    # Normalize OpenGrok URL for line-accurate linking
+    start_line = symbol.get("start_line", None)
+    if start_line:
+        opengrok_url = f"{OPENGROK_BASE_URL_TEMPLATE.rstrip('/')}/{repo}/{relative_path.lstrip('/')}#{start_line}"
     else:
-        base_url = OPENGROK_BASE_URL_TEMPLATE.rstrip("/") + f"/{repo}/"
-    opengrok_url = f"{base_url}{rel_path}?defs={symbol['symbol']}"
+        # fallback to file start if we somehow missed line info
+        opengrok_url = f"{OPENGROK_BASE_URL_TEMPLATE.rstrip('/')}/{repo}/{relative_path.lstrip('/')}"
 
     doc = {
         "id": doc_id,
@@ -440,20 +457,20 @@ def generate_document(chunk, symbol):
 
 def upload_documents(docs, repo_name):
     logger.info(f"[UPLOAD] Would upload {len(docs)} docs (DRY_RUN={DRY_RUN})")
-    if DRY_RUN:
-        # Truncate embedding to first 3 elements + ["..."] for readability
-        trimmed_docs = []
-        for doc in docs:
-            d = dict(doc)
-            if "embedding" in d and isinstance(d["embedding"], list) and len(d["embedding"]) > 3:
-                d["embedding"] = d["embedding"][:3] + ["..."]
-            trimmed_docs.append(d)
+    # Always write a single file per repo per run; no appends, no mixing
+    # Truncate embedding to first 3 elements + ["..."] for readability in dryrun JSON
+    trimmed_docs = []
+    for doc in docs:
+        d = dict(doc)
+        if "embedding" in d and isinstance(d["embedding"], list) and len(d["embedding"]) > 3:
+            d["embedding"] = d["embedding"][:3] + ["..."]
+        trimmed_docs.append(d)
+    dryrun_file = f"dryrun/dryrun_output_{repo_name}.json"
+    with open(dryrun_file, "w", encoding="utf-8") as f:
+        json.dump(trimmed_docs, f, indent=4)
+    logger.info(f"Dry run output: wrote {len(trimmed_docs)} documents for {repo_name} to {dryrun_file}")
 
-        # Always write a single file per repo per run; no appends, no mixing
-        dryrun_file = f"dryrun/dryrun_output_{repo_name}.json"
-        with open(dryrun_file, "w", encoding="utf-8") as f:
-            json.dump(trimmed_docs, f, indent=4)
-        logger.info(f"Dry run: wrote {len(trimmed_docs)} documents for {repo_name} to {dryrun_file}")
+    if DRY_RUN:
         return
 
     # Check if index exists and is accessible
@@ -466,11 +483,21 @@ def upload_documents(docs, repo_name):
     batch_size = 500
     for i in range(0, len(docs), batch_size):
         batch = docs[i:i+batch_size]
-        try:
-            result = search_client.merge_or_upload_documents(documents=batch)
-            logger.info(f"Uploaded batch of {len(batch)} documents, status: {result[0].status_code}")
-        except Exception as e:
-            logger.info(f"Failed to upload batch: {e}")
+        attempts = 0
+        max_attempts = 3
+        while attempts < max_attempts:
+            try:
+                result = search_client.merge_or_upload_documents(documents=batch)
+                logger.info(f"Uploaded batch of {len(batch)} documents, status: {result[0].status_code}")
+                break
+            except Exception as e:
+                attempts += 1
+                if attempts < max_attempts:
+                    logger.info(f"[RETRY] Failed to upload batch (attempt {attempts}/{max_attempts}) for repo {repo_name}: {e}")
+                    logger.info(f"[WAIT] Waiting 30 seconds before retrying...")
+                    time.sleep(30)
+                else:
+                    logger.info(f"[FAIL] Failed to upload batch after {max_attempts} attempts for repo {repo_name}: {e}")
 
 if __name__ == "__main__":
     batch_size = 20
@@ -546,7 +573,7 @@ if __name__ == "__main__":
             logger.info(f"Total time for embeddings + docs for file {file_path}: {file_elapsed:.2f} seconds")
 
             # Only trigger mid-run uploads for NON dry-run mode (batching to the service)
-            if not DRY_RUN and len(doc_buffer) >= 1000:
+            if not DRY_RUN and len(doc_buffer) >= FLUSH_BATCH_SIZE:
                 upload_documents(doc_buffer, repo_name)
                 doc_buffer.clear()
 
