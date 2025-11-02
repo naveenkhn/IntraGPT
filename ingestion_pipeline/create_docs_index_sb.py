@@ -19,7 +19,7 @@ load_dotenv()
 search_service_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
 
 # Give the name you want for the new document index
-index_name = "docs-index-v1"
+index_name = "docs-index-v2"
 
 # API key for Azure Search
 api_key = os.getenv("AZURE_SEARCH_API_KEY")
